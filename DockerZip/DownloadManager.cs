@@ -155,7 +155,7 @@ public sealed class DownloadManager
                     {
                         layerDone = p.Done;
                         Report($"Layer {i + 1}/{layerCount} — {FormatBytes(p.Done)}/{FormatBytes(layer.Size)}",
-                               i, layerCount, doneSoFar + p.Done, totalBytes);
+                               i, layerCount, doneSoFar + p.Done, totalBytes, isLogEntry: false);
                     });
                     await _client.DownloadBlobAsync(image, layer.Digest!, fs, layerProgress, ct);
                     doneSoFar += layer.Size;
@@ -252,7 +252,7 @@ public sealed class DownloadManager
             await using var fs = new FileStream(layerPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, true);
             var layerProgress = new Progress<(long Done, long Total)>(p =>
                 Report($"Layer {i + 1}/{layerCount} — {FormatBytes(p.Done)}/{FormatBytes(layer.Size)}",
-                       i, layerCount, done + p.Done, totalBytes));
+                       i, layerCount, done + p.Done, totalBytes, isLogEntry: false));
 
             await _client.DownloadBlobAsync(image, layer.Digest!, fs, layerProgress, ct);
             done += layer.Size;
@@ -336,8 +336,8 @@ public sealed class DownloadManager
     private static string SanitizeFileName(string name) =>
         string.Concat(name.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
 
-    private void Report(string status, int current, int total, long done, long bytes) =>
-        _progress.Report(new DownloadProgress(status, current, total, done, bytes));
+    private void Report(string status, int current, int total, long done, long bytes, bool isLogEntry = true) =>
+        _progress.Report(new DownloadProgress(status, current, total, done, bytes, isLogEntry));
 }
 
 public record FetchResult(

@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Text.Json;
 
 namespace DockerZip;
@@ -7,19 +8,26 @@ public partial class MainForm : Form
     private CancellationTokenSource? _cts;
     private List<PlatformInfo> _platforms = [];
     private AzureAuthService? _azureAuth;
+    private BackgroundWorker _downloadWorker = null!;
+    private DockerRegistryClient? _downloadClient;
 
     public MainForm()
     {
         InitializeComponent();
+        InitDownloadWorker();
         cboPlatform.Items.Add("auto (linux/amd64)");
         cboPlatform.SelectedIndex = 0;
         LoadConfig();
+        WireConfigAutoSave();
         UpdateButtons(idle: true);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         SaveConfig();
+        _cts?.Cancel();
+        _downloadWorker.Dispose();
+        _downloadClient?.Dispose();
         _azureAuth?.Dispose();
         base.OnFormClosed(e);
     }
@@ -81,7 +89,7 @@ public partial class MainForm : Form
 
     // ── Download ──────────────────────────────────────────────────────────────
 
-    private async void btnDownload_Click(object sender, EventArgs e)
+    private void btnDownload_Click(object sender, EventArgs e)
     {
         if (!ValidateInputs()) return;
 
@@ -98,52 +106,77 @@ public partial class MainForm : Form
         ClearLog();
         ResetProgress();
 
+        // Resolve platform selection
+        string? platform = null;
+        if (cboPlatform.SelectedIndex > 0 && _platforms.Count >= cboPlatform.SelectedIndex)
+            platform = _platforms[cboPlatform.SelectedIndex - 1].ToString();
+
+        _downloadClient = CreateClient();
+        var mgr = new DownloadManager(_downloadClient, new Progress<DownloadProgress>(OnProgress));
+
+        Log($"Starting download \u2192 {outputDir}");
+        Log($"Image:    {txtImage.Text.Trim()}:{txtTag.Text.Trim()}");
+        Log($"Registry: {txtRegistry.Text.Trim()}");
+        if (platform != null) Log($"Platform: {platform}");
+
+        _downloadWorker.RunWorkerAsync(new DownloadArgs(
+            Manager:   mgr,
+            Image:     txtImage.Text.Trim(),
+            Tag:       txtTag.Text.Trim(),
+            Platform:  platform,
+            OutputDir: outputDir,
+            SaveAsTar: chkSaveAsTar.Checked,
+            Token:     _cts.Token));
+    }
+
+    private void InitDownloadWorker()
+    {
+        _downloadWorker = new BackgroundWorker { WorkerSupportsCancellation = true };
+        _downloadWorker.DoWork             += DownloadWorker_DoWork;
+        _downloadWorker.RunWorkerCompleted += DownloadWorker_Completed;
+    }
+
+    private static void DownloadWorker_DoWork(object? sender, DoWorkEventArgs e)
+    {
+        var args = (DownloadArgs)e.Argument!;
         try
         {
-            // Resolve platform selection
-            string? platform = null;
-            if (cboPlatform.SelectedIndex > 0 && _platforms.Count >= cboPlatform.SelectedIndex)
-                platform = _platforms[cboPlatform.SelectedIndex - 1].ToString();
-
-            using var client = CreateClient();
-            var mgr      = new DownloadManager(client, new Progress<DownloadProgress>(OnProgress));
-            var image    = txtImage.Text.Trim();
-            var tag      = txtTag.Text.Trim();
-            var saveAsTar = chkSaveAsTar.Checked;
-            var token    = _cts.Token;
-
-            Log($"Starting download \u2192 {outputDir}");
-            Log($"Image:    {image}:{tag}");
-            Log($"Registry: {txtRegistry.Text.Trim()}");
-            if (platform != null) Log($"Platform: {platform}");
-
-            await Task.Run(() => mgr.DownloadAsync(
-                image: image,
-                reference: tag,
-                platformOverride: platform,
-                outputDir: outputDir,
-                saveAsTar: saveAsTar,
-                ct: token));
-
-            Log("Download complete.");
-            MessageBox.Show("Download finished successfully.", "Done",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            args.Manager.DownloadAsync(
+                image:            args.Image,
+                reference:        args.Tag,
+                platformOverride: args.Platform,
+                outputDir:        args.OutputDir,
+                saveAsTar:        args.SaveAsTar,
+                ct:               args.Token).GetAwaiter().GetResult();
         }
         catch (OperationCanceledException)
         {
-            Log("Download cancelled.");
+            e.Cancel = true;
         }
-        catch (Exception ex)
+        // Other exceptions propagate to RunWorkerCompleted via e.Error
+    }
+
+    private void DownloadWorker_Completed(object? sender, RunWorkerCompletedEventArgs e)
+    {
+        _downloadClient?.Dispose();
+        _downloadClient = null;
+        _cts?.Dispose();
+        _cts = null;
+        UpdateButtons(idle: true);
+
+        if (e.Cancelled)
+            Log("Download cancelled.");
+        else if (e.Error != null)
         {
-            Log($"ERROR: {ex.Message}");
-            MessageBox.Show($"Download failed:\n\n{ex.Message}", "Error",
+            Log($"ERROR: {e.Error.Message}");
+            MessageBox.Show($"Download failed:\n\n{e.Error.Message}", "Error",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
-        finally
+        else
         {
-            _cts?.Dispose();
-            _cts = null;
-            UpdateButtons(idle: true);
+            Log("Download complete.");
+            MessageBox.Show("Download finished successfully.", "Done",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
     }
 
@@ -271,7 +304,7 @@ public partial class MainForm : Form
         if (InvokeRequired) { Invoke(() => OnProgress(p)); return; }
 
         lblStatus.Text = p.Status;
-        Log(p.Status);
+        if (p.IsLogEntry) Log(p.Status);
 
         if (p.LayerTotal > 0)
         {
@@ -326,6 +359,18 @@ public partial class MainForm : Form
         lblStatus.Text = string.Empty;
     }
 
+    private void WireConfigAutoSave()
+    {
+        EventHandler save = (_, _) => SaveConfig();
+        txtRegistry.TextChanged  += save;
+        txtImage.TextChanged     += save;
+        txtTag.TextChanged       += save;
+        txtOutput.TextChanged    += save;
+        txtUsername.TextChanged  += save;
+        chkSaveAsTar.CheckedChanged += save;
+        chkAzureSSO.CheckedChanged  += save;
+    }
+
     // ── Configuration persistence ─────────────────────────────────────────────
 
     private static string ConfigFilePath =>
@@ -377,4 +422,13 @@ public partial class MainForm : Form
         }
         catch { /* best effort */ }
     }
+
+    private record DownloadArgs(
+        DownloadManager   Manager,
+        string            Image,
+        string            Tag,
+        string?           Platform,
+        string            OutputDir,
+        bool              SaveAsTar,
+        CancellationToken Token);
 }

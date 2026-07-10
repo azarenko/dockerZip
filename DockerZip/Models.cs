@@ -95,7 +95,7 @@ public class DockerSaveManifestEntry
 
 // ── Internal progress/result types ────────────────────────────────────────────
 
-public record DownloadProgress(string Status, int LayerCurrent, int LayerTotal, long BytesDone, long BytesTotal);
+public record DownloadProgress(string Status, int LayerCurrent, int LayerTotal, long BytesDone, long BytesTotal, bool IsLogEntry = false);
 
 // ── Persisted application configuration ───────────────────────────────────────
 
