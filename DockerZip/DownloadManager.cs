@@ -105,7 +105,7 @@ public sealed class DownloadManager
         {
             var safeName = SanitizeFileName($"{image.Replace('/', '_')}_{reference}");
             var tarPath = Path.Combine(outputDir, $"{safeName}.tar");
-            await SaveAsTarAsync(image, reference, manifest, tarPath, layerCount, totalBytes, ct);
+            await SaveAsFlatAsync(image, manifest, tarPath, layerCount, totalBytes, ct);
             Report($"Saved: {tarPath}", layerCount, layerCount, totalBytes, totalBytes);
         }
         else
@@ -115,112 +115,139 @@ public sealed class DownloadManager
         }
     }
 
-    // ── docker-save .tar ─────────────────────────────────────────────────────
+    // ── Flat filesystem snapshot ──────────────────────────────────────────────
 
-    private async Task SaveAsTarAsync(
-        string image, string reference,
+    /// <summary>
+    /// Downloads all layers, merges them in order (applying whiteout semantics),
+    /// and writes a single flat tar representing the final container filesystem.
+    /// </summary>
+    private async Task SaveAsFlatAsync(
+        string image,
         DockerManifest manifest,
         string tarPath,
         int layerCount, long totalBytes,
         CancellationToken ct)
     {
-        // Download config to memory
-        Report($"Downloading config ({FormatBytes(manifest.Config!.Size)})…", 0, layerCount, 0, totalBytes);
-        var configBytes = await DownloadBlobToMemoryAsync(image, manifest.Config.Digest!, ct);
-
-        var configHex = DigestToHex(manifest.Config.Digest!);
-
-        // Temp dir for layer blobs
         var tmp = Path.Combine(Path.GetTempPath(), $"dockerzip_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tmp);
 
         try
         {
-            var layerFiles = new List<string>();
-            long doneSoFar = manifest.Config.Size;
+            // ── 1. Download and decompress every layer ───────────────────────
+            var layerTars = new List<string>();
+            long doneSoFar = 0;
 
             for (int i = 0; i < manifest.Layers!.Count; i++)
             {
                 var layer = manifest.Layers[i];
                 var layerHex = DigestToHex(layer.Digest!);
                 var gzPath = Path.Combine(tmp, $"{layerHex}.tar.gz");
+                var tarLayerPath = Path.Combine(tmp, $"{layerHex}.tar");
 
                 Report($"Downloading layer {i + 1}/{layerCount} ({FormatBytes(layer.Size)})…",
                        i, layerCount, doneSoFar, totalBytes);
 
                 await using (var fs = new FileStream(gzPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, true))
                 {
-                    long layerDone = 0;
-                    var layerProgress = new Progress<(long Done, long Total)>(p =>
-                    {
-                        layerDone = p.Done;
+                    var progress = new Progress<(long Done, long Total)>(p =>
                         Report($"Layer {i + 1}/{layerCount} — {FormatBytes(p.Done)}/{FormatBytes(layer.Size)}",
-                               i, layerCount, doneSoFar + p.Done, totalBytes, isLogEntry: false);
-                    });
-                    await _client.DownloadBlobAsync(image, layer.Digest!, fs, layerProgress, ct);
+                               i, layerCount, doneSoFar + p.Done, totalBytes, isLogEntry: false));
+                    await _client.DownloadBlobAsync(image, layer.Digest!, fs, progress, ct);
                     doneSoFar += layer.Size;
                 }
 
-                layerFiles.Add(gzPath);
+                await using (var gzStream = new FileStream(gzPath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, true))
+                await using (var decompressed = new GZipStream(gzStream, CompressionMode.Decompress))
+                await using (var outFile = new FileStream(tarLayerPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, true))
+                    await decompressed.CopyToAsync(outFile, ct);
+
+                File.Delete(gzPath);
+                layerTars.Add(tarLayerPath);
             }
 
-            // ── Build manifest.json for docker load ─────────────────────────
-            var layerPaths = Enumerable.Range(0, layerCount)
-                .Select(i => $"{DigestToHex(manifest.Layers[i].Digest!)}/layer.tar")
-                .ToList();
+            // ── 2. Build merged file map (later layers win) ──────────────────
+            // path → owning layer index; -1 means deleted by whiteout
+            Report("Merging layers…", layerCount - 1, layerCount, totalBytes - 1, totalBytes);
 
-            var dockerManifestJson = JsonSerializer.Serialize(new[]
+            var fileMap = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            for (int i = 0; i < layerTars.Count; i++)
             {
-                new DockerSaveManifestEntry
+                await using var layerStream = new FileStream(layerTars[i], FileMode.Open, FileAccess.Read, FileShare.Read);
+                using var reader = new TarReader(layerStream, leaveOpen: false);
+
+                while (await reader.GetNextEntryAsync(copyData: false, ct) is { } entry)
                 {
-                    Config = $"{configHex}.json",
-                    RepoTags = [$"{image}:{reference}"],
-                    Layers = layerPaths
+                    var name = NormalizeTarPath(entry.Name);
+                    var fileName = Path.GetFileName(name.TrimEnd('/'));
+
+                    if (fileName == ".wh..wh..opq")
+                    {
+                        // Opaque whiteout: replace entire parent directory contents
+                        var dir = Path.GetDirectoryName(name.TrimEnd('/'))?.Replace('\\', '/') ?? "";
+                        if (dir.Length > 0 && !dir.EndsWith('/')) dir += "/";
+                        foreach (var key in fileMap.Keys.Where(k => k == dir.TrimEnd('/') || k.StartsWith(dir)).ToList())
+                            fileMap[key] = -1;
+                        continue;
+                    }
+
+                    if (fileName.StartsWith(".wh."))
+                    {
+                        // Regular whiteout: delete the named target
+                        var dir = Path.GetDirectoryName(name)?.Replace('\\', '/') ?? "";
+                        var target = dir.Length > 0 ? $"{dir}/{fileName[4..]}" : fileName[4..];
+                        fileMap[target] = -1;
+                        fileMap[name] = -1;
+                        continue;
+                    }
+
+                    fileMap[name] = i;
                 }
-            });
+            }
 
-            // ── Write outer tar ──────────────────────────────────────────────
-            Report("Assembling .tar file…", layerCount - 1, layerCount, totalBytes - 1, totalBytes);
+            // ── 3. Write flat output tar ─────────────────────────────────────
+            Report("Assembling flat snapshot…", layerCount - 1, layerCount, totalBytes - 1, totalBytes);
 
-            await using var tarStream = new FileStream(tarPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, true);
-            await using var tarWriter = new TarWriter(tarStream, TarEntryFormat.Gnu, leaveOpen: false);
+            await using var outTarStream = new FileStream(tarPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, true);
+            await using var tarWriter = new TarWriter(outTarStream, TarEntryFormat.Gnu, leaveOpen: false);
 
-            // manifest.json
-            await WriteMemoryEntryAsync(tarWriter, "manifest.json",
-                Encoding.UTF8.GetBytes(dockerManifestJson));
+            var written = new HashSet<string>(StringComparer.Ordinal);
 
-            // config JSON
-            await WriteMemoryEntryAsync(tarWriter, $"{configHex}.json", configBytes);
-
-            // layers — decompress from gz to plain tar inside the outer tar
-            for (int i = 0; i < layerFiles.Count; i++)
+            for (int i = 0; i < layerTars.Count; i++)
             {
-                var layerHex = DigestToHex(manifest.Layers[i].Digest!);
-                var dirEntry = new GnuTarEntry(TarEntryType.Directory, $"{layerHex}/");
-                await tarWriter.WriteEntryAsync(dirEntry, ct);
+                await using var layerStream = new FileStream(layerTars[i], FileMode.Open, FileAccess.Read, FileShare.Read);
+                using var reader = new TarReader(layerStream, leaveOpen: false);
 
-                await using var gzStream = new FileStream(layerFiles[i], FileMode.Open, FileAccess.Read, FileShare.Read, 65536, true);
-                await using var decompressed = new GZipStream(gzStream, CompressionMode.Decompress);
-
-                // Stream the decompressed data via a temp file (TarWriter needs seekable stream for size)
-                var decompPath = layerFiles[i].Replace(".tar.gz", "_decompressed.tar");
-                await using (var decompFile = new FileStream(decompPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, true))
-                    await decompressed.CopyToAsync(decompFile, ct);
-
-                await using var decompRead = new FileStream(decompPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                var layerEntry = new GnuTarEntry(TarEntryType.RegularFile, $"{layerHex}/layer.tar")
+                while (await reader.GetNextEntryAsync(copyData: false, ct) is { } entry)
                 {
-                    DataStream = decompRead
-                };
-                await tarWriter.WriteEntryAsync(layerEntry, ct);
+                    var name = NormalizeTarPath(entry.Name);
+                    var fileName = Path.GetFileName(name.TrimEnd('/'));
 
-                File.Delete(decompPath);
+                    // Skip whiteout marker files
+                    if (fileName.StartsWith(".wh.")) continue;
+
+                    // Skip if this layer isn't the owner of this path
+                    if (!fileMap.TryGetValue(name, out var owner) || owner != i) continue;
+
+                    // Skip duplicates (safety)
+                    if (!written.Add(name)) continue;
+
+                    await tarWriter.WriteEntryAsync(entry, ct);
+                }
             }
         }
         finally
         {
             try { Directory.Delete(tmp, recursive: true); } catch { /* best effort */ }
         }
+    }
+
+    private static string NormalizeTarPath(string path)
+    {
+        path = path.Replace('\\', '/');
+        if (path.StartsWith("./")) path = path[2..];
+        else if (path.StartsWith("/")) path = path[1..];
+        return path;
     }
 
     // ── Raw blobs ─────────────────────────────────────────────────────────────
@@ -265,22 +292,6 @@ public sealed class DownloadManager
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private async Task<byte[]> DownloadBlobToMemoryAsync(string image, string digest, CancellationToken ct)
-    {
-        await using var ms = new MemoryStream();
-        await _client.DownloadBlobAsync(image, digest, ms, null, ct);
-        return ms.ToArray();
-    }
-
-    private static async Task WriteMemoryEntryAsync(TarWriter writer, string entryName, byte[] data)
-    {
-        var entry = new GnuTarEntry(TarEntryType.RegularFile, entryName)
-        {
-            DataStream = new MemoryStream(data)
-        };
-        await writer.WriteEntryAsync(entry);
-    }
 
     private static ManifestListEntry PickPlatform(ManifestList list, string? platformOverride)
     {

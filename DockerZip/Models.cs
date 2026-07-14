@@ -79,20 +79,6 @@ public class PlatformInfo
     }
 }
 
-// ── docker save manifest.json entry ───────────────────────────────────────────
-
-public class DockerSaveManifestEntry
-{
-    [JsonPropertyName("Config")]
-    public string? Config { get; set; }
-
-    [JsonPropertyName("RepoTags")]
-    public List<string>? RepoTags { get; set; }
-
-    [JsonPropertyName("Layers")]
-    public List<string>? Layers { get; set; }
-}
-
 // ── Internal progress/result types ────────────────────────────────────────────
 
 public record DownloadProgress(string Status, int LayerCurrent, int LayerTotal, long BytesDone, long BytesTotal, bool IsLogEntry = false);

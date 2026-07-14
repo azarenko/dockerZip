@@ -105,7 +105,7 @@ partial class MainForm
         btnBrowse = new Button { Text = "Browse…", Location = new Point(580, 57), Size = new Size(82, 27), Anchor = AnchorStyles.Top | AnchorStyles.Right };
         btnBrowse.Click += btnBrowse_Click;
 
-        chkSaveAsTar = new CheckBox { Text = "Save as docker-loadable .tar  (docker load -i <file>.tar)", Location = new Point(86, 90), AutoSize = true, Checked = true };
+        chkSaveAsTar = new CheckBox { Text = "Save as flattened filesystem .tar  (merged layers, extract with tar -xf)", Location = new Point(86, 90), AutoSize = true, Checked = true };
 
         grpSettings.Controls.AddRange([lblPlatform, cboPlatform, lblOutput, txtOutput, btnBrowse, chkSaveAsTar]);
 
