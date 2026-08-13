@@ -124,10 +124,12 @@ public sealed class DockerRegistryClient : IDisposable
         var numChunks = (int)Math.Ceiling((double)total / chunkSize);
         var downloaded = new long[numChunks];
         var downloadLock = new object();
-        var totalDone = 0L;
 
         // Pre-allocate destination file
         destination.SetLength(total);
+
+        // Get auth token for all chunks (acquire once, reuse)
+        var token = await GetBlobAuthTokenAsync(url, ct);
 
         // Create chunk download tasks
         var semaphore = new SemaphoreSlim(maxConcurrent);
@@ -143,12 +145,28 @@ public sealed class DockerRegistryClient : IDisposable
             var chunkLen = end - start + 1;
 
             var task = DownloadChunkAsync(url, destination, chunkIdx, start, end, chunkLen, 
-                                          downloaded, downloadLock, total, progress, ct)
+                                          downloaded, downloadLock, total, token, progress, ct)
                 .ContinueWith(_ => semaphore.Release(), ct);
             tasks.Add(task);
         }
 
         await Task.WhenAll(tasks);
+    }
+
+    /// <summary>Acquires auth token for blob downloads.</summary>
+    private async Task<string?> GetBlobAuthTokenAsync(string url, CancellationToken ct)
+    {
+        var req = new HttpRequestMessage(HttpMethod.Get, url);
+        using var resp = await _http.SendAsync(req, ct);
+
+        if (resp.StatusCode != HttpStatusCode.Unauthorized)
+            return null;
+
+        var wwwAuth = resp.Headers.WwwAuthenticate.FirstOrDefault()?.ToString();
+        if (string.IsNullOrEmpty(wwwAuth))
+            return null;
+
+        return await AcquireTokenAsync(wwwAuth, ct);
     }
 
     /// <summary>Downloads a single chunk of a blob.</summary>
@@ -162,6 +180,7 @@ public sealed class DockerRegistryClient : IDisposable
         long[] downloaded,
         object lockObj,
         long total,
+        string? token,
         IProgress<(long Done, long Total)>? progress,
         CancellationToken ct)
     {
@@ -170,15 +189,19 @@ public sealed class DockerRegistryClient : IDisposable
             var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.Range = new RangeHeaderValue(start, end);
 
-            // Acquire token if needed (reuse cached token or get new one)
-            // For simplicity, we'll attempt the request and let the server handle auth
-            using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-            
-            if (resp.StatusCode == HttpStatusCode.Unauthorized)
+            // Add auth headers
+            if (token != null)
             {
-                // If auth fails, this is a fundamental issue - let caller handle
-                resp.EnsureSuccessStatusCode();
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             }
+            else if (!string.IsNullOrEmpty(_username))
+            {
+                var cred = Convert.ToBase64String(
+                    System.Text.Encoding.UTF8.GetBytes($"{_username}:{_password}"));
+                req.Headers.Authorization = new AuthenticationHeaderValue("Basic", cred);
+            }
+
+            using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
             resp.EnsureSuccessStatusCode();
 
             await using var src = await resp.Content.ReadAsStreamAsync(ct);
