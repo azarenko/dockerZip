@@ -78,24 +78,25 @@ public sealed class DockerRegistryClient : IDisposable
         // If blob is small or ranges not supported, use single-stream download
         if (total < 0 || total < 5 * 1024 * 1024 || !supportsRanges)
         {
-            await DownloadBlobSingleStreamAsync(url, destination, total, progress, ct);
+            await DownloadBlobSingleStreamAsync(url, image, destination, total, progress, ct);
             return;
         }
 
         // Parallel chunk download
-        await DownloadBlobParallelAsync(url, destination, total, progress, ct);
+        await DownloadBlobParallelAsync(url, image, destination, total, progress, ct);
     }
 
     /// <summary>Single-stream blob download (fallback).</summary>
     private async Task DownloadBlobSingleStreamAsync(
         string url,
+        string image,
         Stream destination,
         long total,
         IProgress<(long Done, long Total)>? progress,
         CancellationToken ct)
     {
-        var req = new HttpRequestMessage(HttpMethod.Get, url);
-        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        // Use the standard SendAsync for proper auth handling
+        using var resp = await SendAsync(url, [], image, "pull", ct);
         resp.EnsureSuccessStatusCode();
 
         await using var src = await resp.Content.ReadAsStreamAsync(ct);
@@ -113,6 +114,7 @@ public sealed class DockerRegistryClient : IDisposable
     /// <summary>Parallel chunk download with concurrent requests.</summary>
     private async Task DownloadBlobParallelAsync(
         string url,
+        string image,
         Stream destination,
         long total,
         IProgress<(long Done, long Total)>? progress,
@@ -128,8 +130,9 @@ public sealed class DockerRegistryClient : IDisposable
         // Pre-allocate destination file
         destination.SetLength(total);
 
-        // Get auth token for all chunks (acquire once, reuse)
-        var token = await GetBlobAuthTokenAsync(url, ct);
+        // Get auth token using proper SendAsync flow (handles 401 and caching)
+        var cacheKey = $"{image}:pull";
+        _tokenCache.TryGetValue(cacheKey, out var token);
 
         // Create chunk download tasks
         var semaphore = new SemaphoreSlim(maxConcurrent);
@@ -142,9 +145,8 @@ public sealed class DockerRegistryClient : IDisposable
             var chunkIdx = i;
             var start = (long)chunkIdx * chunkSize;
             var end = Math.Min(start + chunkSize - 1, total - 1);
-            var chunkLen = end - start + 1;
 
-            var task = DownloadChunkAsync(url, destination, chunkIdx, start, end, chunkLen, 
+            var task = DownloadChunkAsync(url, destination, chunkIdx, start, end, 
                                           downloaded, downloadLock, total, token, progress, ct)
                 .ContinueWith(_ => semaphore.Release(), ct);
             tasks.Add(task);
@@ -154,10 +156,16 @@ public sealed class DockerRegistryClient : IDisposable
     }
 
     /// <summary>Acquires auth token for blob downloads.</summary>
-    private async Task<string?> GetBlobAuthTokenAsync(string url, CancellationToken ct)
+    private async Task<string?> GetBlobAuthTokenAsync(string url, string image, CancellationToken ct)
     {
+        // Try to get cached token first
+        var cacheKey = $"{image}:pull";
+        if (_tokenCache.TryGetValue(cacheKey, out var cachedToken))
+            return cachedToken;
+
+        // Make a request to trigger 401 and get auth challenge
         var req = new HttpRequestMessage(HttpMethod.Get, url);
-        using var resp = await _http.SendAsync(req, ct);
+        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
 
         if (resp.StatusCode != HttpStatusCode.Unauthorized)
             return null;
@@ -166,7 +174,11 @@ public sealed class DockerRegistryClient : IDisposable
         if (string.IsNullOrEmpty(wwwAuth))
             return null;
 
-        return await AcquireTokenAsync(wwwAuth, ct);
+        var token = await AcquireTokenAsync(wwwAuth, ct);
+        if (token != null)
+            _tokenCache[cacheKey] = token;
+
+        return token;
     }
 
     /// <summary>Downloads a single chunk of a blob.</summary>
@@ -176,7 +188,6 @@ public sealed class DockerRegistryClient : IDisposable
         int chunkIdx,
         long start,
         long end,
-        long chunkLen,
         long[] downloaded,
         object lockObj,
         long total,
